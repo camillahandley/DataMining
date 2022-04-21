@@ -1,0 +1,262 @@
+---
+title: "Complaints"
+author: "Camilla Handley"
+date: "4/8/2021"
+output: word_document
+---
+```{r}
+library(dplyr)
+library(tidytext)
+library(ggplot2)
+library(forcats)
+library(keras)
+library(purrr)
+library(tidyverse)
+library(tidymodels)
+library(textrecipes)
+library(discrim)
+library(stopwords)
+library(ranger)
+library(themis)
+library(hardhat)
+```
+
+```{r}
+# Read in the data
+comps <- read.csv("/Users/camillahandley/Desktop/Stat 536/CompanyComplaints.csv")
+n = nrow(comps)
+
+text_df <- tibble(CompNum = 1:n, Department = comps$Department, text = comps$Complaint)
+
+text <- text_df %>% 
+  unnest_tokens(word, text) 
+  
+depart_words <- text %>% count(Department, word, sort = T)
+total_words <- depart_words %>% 
+  group_by(Department) %>% 
+  summarise(total = sum(n))
+
+depart_words <- left_join(depart_words, total_words)
+
+```
+
+```{r}
+# Graph of term frequency 
+ggplot(depart_words, aes(n/total, fill = Department)) +
+  geom_histogram(show.legend = FALSE) +
+  xlim(NA, 0.0009) +
+  facet_wrap(~Department, ncol = 2, scales = "free_y")
+```
+
+```{r}
+# Look at tdidf
+Comp_tf_idf <- depart_words %>%
+  bind_tf_idf(word, Department, n)
+
+Comp_tf_idf %>%
+  group_by(Department) %>%
+  slice_max(tf_idf, n = 15) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = Department)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Department, ncol = 2, scales = "free") +
+  labs(x = "tf-idf", y = NULL)
+```
+
+
+```{r}
+# Try a Naive Bayes model
+set.seed(123)
+
+text_df$departnum <- as.numeric(as.factor(text_df$Department))
+text_df <- text_df %>%
+  mutate(depart = factor(x = departnum, levels = departnum, labels = Department))
+
+ggplot(data = text_df, mapping = aes(x = fct_infreq(depart) %>% fct_rev())) +
+  geom_bar() +
+  coord_flip() +
+  labs(
+    title = "Distribution of complaints",
+    subtitle = "By Department ",
+    x = NULL,
+    y = "Number of complaints"
+  ) +
+  scale_x_discrete(labels = function(x) str_extract(x, '([a-zA-Z]+[ ]*){1,2}')) 
+
+comps_split <- initial_split(data = text_df, strata = depart, prop = .8)
+comps_split
+
+train <- training(comps_split)
+test <- testing(comps_split)
+```
+
+```{r}
+comp_rec <- recipe(depart ~ text, data = train)
+comp_rec <- comp_rec %>%
+  step_tokenize(text) %>%
+  step_stopwords(text) %>%
+  step_tokenfilter(text, max_tokens = 500) %>%
+  step_tfidf(text) 
+
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+
+nb_wf <- workflow() %>%
+  add_recipe(comp_rec) %>%
+  add_model(nb_spec)
+
+nb_wf %>%
+  fit(data = train)
+```
+
+```{r}
+# Run a cross validation study 
+comps_folds <- vfold_cv(data = train, strata = depart)
+
+nb_cv <- nb_wf %>%
+  fit_resamples(
+    comps_folds,
+    control = control_resamples(save_pred = TRUE)
+  )
+
+nb_cv_metrics <- collect_metrics(nb_cv)
+nb_cv_predictions <- collect_predictions(nb_cv)
+
+nb_cv_metrics
+```
+```{r}
+nb_cv_predictions %>%
+  filter(id == "Fold01") %>%
+  conf_mat(depart, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 20)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 20))
+```
+
+```{r}
+
+# build on existing recipe and downsample because of unbalanced data
+comp_rec <- comp_rec %>%
+  step_downsample(depart)
+
+multi_spec <- multinom_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("classification") %>% 
+  set_engine("glmnet")
+
+sparse_bp <- default_recipe_blueprint(composition = "dgCMatrix")
+
+multi_lasso_wf <- workflow() %>%
+  add_recipe(comp_rec, blueprint = sparse_bp) %>%
+  add_model(multi_spec)
+
+multi_lasso_wf
+
+smaller_lambda <- grid_regular(penalty(range = c(-5, 0)), levels = 20)
+smaller_lambda
+```
+```{r}
+multi_lasso_rs <- tune_grid(
+  multi_lasso_wf,
+  comps_folds,
+  grid = smaller_lambda,
+  control = control_resamples(save_pred = TRUE)
+)
+
+multi_lasso_rs
+
+```
+```{r}
+best_acc <- multi_lasso_rs %>%
+  show_best("accuracy")
+best_acc
+```
+
+
+```{r}
+multi_lasso_rs %>%
+  collect_predictions() %>%
+  filter(penalty == best_acc$penalty) %>%
+  #filter(id == "Fold01") %>%
+  conf_mat(depart, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_extract(x, '([a-zA-Z]+[ ]*){1,2}')) +
+  scale_x_discrete(labels = function(x) str_extract(x, '([a-zA-Z]+[ ]*){1,2}')) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+
+```{r}
+multi_lasso_rs %>%
+  collect_predictions() %>%
+  filter(penalty == best_acc$penalty) %>%
+  #filter(id == "Fold01") %>%
+  filter(.pred_class != depart) %>%
+  conf_mat(depart, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_extract(x, '([a-zA-Z]+[ ]*){1,2}')) +
+  scale_x_discrete(labels = function(x) str_extract(x, '([a-zA-Z]+[ ]*){1,2}')) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+```{r}
+final_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  levels = c(penalty = 20)
+)
+
+tune_rs <- tune_grid(
+  multi_lasso_wf,
+  comps_folds,
+  grid = final_grid,
+  metrics = metric_set(accuracy, sensitivity, specificity)
+)
+
+choose_acc <- tune_rs %>%
+  select_by_pct_loss(metric = "accuracy", -penalty)
+
+final_wf <- finalize_workflow(multi_lasso_wf, choose_acc)
+
+final_fitted <- last_fit(final_wf, comps_split)
+
+collect_metrics(final_fitted)
+```
+
+```{r}
+library(vip)
+
+complaints_imp <- pull_workflow_fit(final_fitted$.workflow[[1]]) %>%
+  vi(lambda = choose_acc$penalty)
+
+complaints_imp %>%
+  mutate(
+    Sign = case_when(Sign == "POS" ~ "More Department-specific",
+                     Sign == "NEG" ~ "Less Department-specific"),
+    Importance = abs(Importance),
+    Variable = str_remove_all(Variable, "tfidf_text_")
+  ) %>%
+  group_by(Sign) %>%
+  top_n(20, Importance) %>%
+  ungroup %>%
+  ggplot(aes(x = Importance,
+             y = fct_reorder(Variable, Importance),
+             fill = Sign)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_continuous(expand = c(0, 0)) +
+  facet_wrap(~Sign, scales = "free") +
+  labs(
+    y = NULL,
+    title = "Variable Importance for Identifying Department"
+  )
+```
+
+```{r}
+# Predict the new complaints 
+newComps <- read.csv("/Users/camillahandley/Desktop/Stat 536/WhichDepartment.csv")
+colnames(newComps) <- "text"
+
+fit <- fit(final_wf, text_df)
+preds <- predict(fit, newComps)
+
+preds
+```
+

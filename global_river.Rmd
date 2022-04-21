@@ -1,0 +1,145 @@
+---
+title: "Global River"
+author: "Connie Mui"
+date: "2/2/2021"
+output: html_document
+---
+
+```{r setup}
+library(readr)
+set.seed(536)
+Rivers <- read_csv('/Users/camillahandley/Desktop/Stat 536/Rivers.csv')
+sd(Rivers$Metric)
+# View(Rivers)
+```
+
+
+```{r}
+#summary(Rivers)
+
+# take out the last 4 cols
+r_cut <- Rivers[1:94]
+
+# Exploratory plots 
+
+```
+
+
+```{r}
+# library
+library("dplyr") 
+library("glmnet") 
+library("ggplot2") 
+library("caret") 
+
+# X and Y datasets 
+Y <- r_cut %>% 
+	dplyr::select(Metric) %>% 
+	scale(center = TRUE, scale = FALSE) %>% 
+	as.matrix() 
+X <- r_cut %>% 
+	dplyr::select(-Metric) %>% 
+	as.matrix() 
+
+# Model Building : Elastic Net Regression 
+control <- trainControl(method = "repeatedcv", 
+							number = 5, 
+							repeats = 5, 
+							search = "random", 
+							verboseIter = TRUE) 
+
+# Training ELastic Net Regression model 
+elastic_model <- train(Metric ~ ., 
+						data = cbind(Y,X), 
+						method = "glmnet", 
+						preProcess = c("center", "scale"), 
+						tuneLength = 25, 
+						trControl = control) 
+
+elastic_model 
+# Fitting alpha = 0.433, lambda = 0.054
+
+# Model Prediction 
+x_hat_pre <- predict(elastic_model, X) 
+x_hat_pre 
+
+# Multiple R-squared 
+rsq <- cor(Y, x_hat_pre)^2 
+rsq  #0.793
+
+# Plot 
+plot(elastic_model, main = "Elastic Net Regression") 
+```
+
+```{r}
+# bootstrap
+set.seed(536)
+Nsim <- 1000
+bootst <- replicate(Nsim, {
+  
+  data <- sample(nrow(r_cut), replace = T)
+  samp <- r_cut[data,]
+  
+  # X and Y datasets 
+  Y <- samp %>% 
+	dplyr::select(Metric) %>% 
+	scale(center = TRUE, scale = FALSE) %>% 
+	as.matrix() 
+  X <- samp %>% 
+	dplyr::select(-Metric) %>% 
+	as.matrix() 
+  
+  model <- glmnet(X,Y,alpha = 0.434, lambda = 0.054)
+  results<-coef(model)[,1]
+  results
+})
+# bootst
+
+mat <- data.frame(lwr = apply(bootst, 1, quantile, c(0.025)), 
+                      upr = apply(bootst, 1, quantile, c(0.975)),
+                  est = apply(bootst, 1, quantile, c(0.5)))
+mat2 <- mat %>% filter((lwr > 0 & upr > 0) | (lwr < 0 & upr < 0))
+
+```
+
+```{r}
+# X and Y datasets 
+Y <- r_cut %>% 
+	dplyr::select(Metric) %>% 
+	scale(center = TRUE, scale = FALSE) 
+X <- r_cut %>% 
+	dplyr::select(-Metric) 
+
+# Cross Validation
+mse <- rep(NA, nrow(r_cut))
+bias <- rep(NA, nrow(r_cut))
+for(i in 1:nrow(r_cut)){
+  x.train = X[-i,]
+  x.test  = X[i,]
+  y.train = Y[-i,]
+  y.test  = Y[i,]
+  train.fit  = glmnet(as.matrix(x.train), as.matrix(y.train), family="gaussian", alpha = 0.433, lambda = 0.054)
+  yhat = predict(train.fit, as.matrix(x.test))
+  mse[i] <- (y.test - yhat)^2
+  bias[i] <- yhat - y.test
+}
+
+mean(mse)
+mean(bias)
+
+# Calculate R^2 
+fit <- glmnet(as.matrix(X), as.matrix(Y), family="gaussian", alpha = 0.433, lambda = 0.054)
+y.hat = predict(fit, newx = X)
+R2 <- 1 - sum((Y - y.hat)^2) / sum((Y - mean(Y))^2)
+# R squared = 1 - sum(y - yhat)^2/sum(y-ybar)^2
+
+```
+
+
+What are the biggest climate / river network / human factors that impact overall river flow. => model
+
+How well do the factors you listed in #1 explain overall flow? => R^2, p-values
+
+How predictive of overall flow are these identified factors? => cross volidation, bias, mse, CI
+
+

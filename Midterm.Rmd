@@ -1,0 +1,522 @@
+---
+title: "Lodgepole Midterm"
+author: "Camilla Handley"
+date: "3/10/2021"
+output: pdf_document
+---
+
+```{r}
+library(ggplot2)
+library(GGally)
+library(dplyr)
+library(car)
+library(splines)
+library(mgcv)
+library(gstat)
+```
+
+```{r}
+
+predictgls <- function(glsobj, newdframe=NULL, level=0.95){
+  
+  ## If no new dataframe provided, used the dataframe from glsobj
+  ## and create a joint dataframe
+  if(is.null(newdframe)){
+    newdframe <- eval(glsobj$call$data)
+  }
+  n <- nrow(eval(glsobj$call$data))
+  
+  ## Create a joint data frame
+  jdframe <- rbind(eval(glsobj$call$data)[names(newdframe)],newdframe)
+  
+  ## Get point predictions of new data frame
+  ## Need to break apart formula, remove response then rebuild formula
+  the.form <- as.formula(glsobj$call$model)
+  the.terms <- terms(the.form,data=newdframe)
+  the.terms <- delete.response(the.terms)
+  the.form <- as.formula(paste0(the.terms, collapse=""))
+  the.fx <- attr(the.terms, "term.labels")
+  the.vars <- sapply(1:length(the.fx), function(trm){
+    vn <- all.vars(as.formula(paste0("~",the.fx[trm])))
+    if("pi"%in%vn){
+      vn <- vn[vn!="pi"]
+    }
+    return(vn)
+  })
+  if(length(the.fx)>0){
+    Xpred <- lapply(1:length(the.vars), function(x){
+      if(substr(the.fx[x], 1, 2)%in%c("ns", "bs", "poly")){
+        Xbase <- with(eval(glsobj$call$data), eval(parse(text=the.fx[x])))
+        xp <- predict(Xbase, newx=newdframe[[the.vars[x]]])
+      } else {
+        tf <- as.formula(paste0("~", the.fx[x]))
+        xp <- matrix(c(model.matrix(tf, data=newdframe)[,-1]), nrow=nrow(newdframe))
+      }
+      return(xp)
+    })
+    Xpred <- cbind(1, do.call("cbind", Xpred))
+  } else {
+    Xpred <- matrix(1, ncol=1, nrow=nrow(newdframe))
+  }
+  predVals <- c(Xpred%*%glsobj$coefficients)
+  var.from.bhat <- diag(Xpred%*%vcov(glsobj)%*%t(Xpred)/(sigma(glsobj)^2))
+  
+  ## If original model has a variance structure then construct the diagonal
+  ## matrices accordingly
+  if("varStruct"%in%names(glsobj$modelStruct)){
+    
+    ## Get Parameters of Variance structure
+    var.pars <- coef(glsobj$modelStruct$varStruct,unconstrained=FALSE)
+    
+    ## If fixed variance structure then there will be no parameters
+    if(length(var.pars)==0){
+      ## Initialize var matrix using joint data frame
+      var.call <- deparse(glsobj$call$weights)
+      
+    } else {
+      ## Initialize var matrix using joint data frame
+      var.call <- deparse(glsobj$call$weights)
+      var.call <- paste(substr(var.call,1,nchar(var.call)-1),", value = c(",
+                        paste(paste(names(var.pars),as.character(var.pars),sep="="),
+                              collapse=","),"))")
+    }
+    
+    #Initialize weights
+    varMat.i <- Initialize(eval(parse(text=var.call)),data=jdframe)
+    
+    ## Create the SD weights
+    W <- varWeights(varMat.i)
+    W1 <- W[1:n]
+    W2 <- W[-(1:n)]
+    
+  } else {
+    
+    ## No variance model structure then weights are all 1
+    W1 <- rep(1,n)
+    W2 <- rep(1,nrow(jdframe)-n)
+    
+  } ## End if("varStruct"%in%names(glsobj$modelStruct))
+  
+  ## If original model has correlation structure then construct joint
+  ## correlation matrix and calculate conditional correlation matrix
+  if("corStruct"%in%names(glsobj$modelStruct)){
+    ## Get Parameters and call for correlation structure
+    cor.pars <- coef(glsobj$modelStruct$corStruct,unconstrained=FALSE)
+    cor.call <- deparse(glsobj$call$correlation)
+    cor.call <- paste(substr(cor.call,1,nchar(cor.call)-1),", value = c(",
+                      paste(as.character(cor.pars),collapse=","),"),fixed=TRUE)")
+    cor.covar <- model.matrix(attr(eval(parse(text=cor.call)), "formula"), data=jdframe)
+    if(as.character(glsobj$call$correlation)[1]=='corSymm'){
+      warning(paste("The general correlation structure corSymm() cannot be used",
+                    "for prediction.  Returning prediction without correlation."))
+      allpreds <- predVals
+      allpreds.se <- (1/W2)*rep(1,nrow(newdframe))
+    } else if(any(duplicated(cor.covar))){
+      warning(paste("Some prediction locations are the same as observed locations",
+                    "resulting in a singular correlation matrix.",
+                    "Returning prediction without correlation."))
+      allpreds <- predVals
+      allpreds.se <- (1/W2)*rep(1,nrow(newdframe))
+    } else {
+      ## Initialize joint correlation matrix using joint data frame
+      corMat.i <- Initialize(eval(parse(text=cor.call)),data=jdframe)
+      
+      ## If there are no groups (all data belong to same group) then create a joint
+      ## correlation matrix.  If there are groups (each group independent) then loop
+      ## through the groups calculating correlation each time.
+      if(is.null(glsobj$groups) | length(unique(glsobj$group))==1){
+        corMats <- corMatrix(corMat.i, corr=TRUE)
+        nr <- nrow(corMats)
+        predMat <- corMats[(n+1):nr,1:n]%*%chol2inv(chol(corMats[(1:n),(1:n)]))
+        allpreds <- predVals+(1/W2)*(predMat%*%(glsobj$residuals*W1))
+        allpreds.se <- (1/W2)*sqrt((1-rowSums(predMat*corMats[(n+1):nr,1:n])))
+      } else {
+        pred.grps <- sort(getGroups(newdframe,form=as.formula(glsobj$call$correlation$form)))
+        ugrps <- as.character(unique(pred.grps))
+        norig <- table(glsobj$groups)
+        corMats <- corMatrix(corMat.i)[ugrps]
+        getpred <- function(x){
+          nr <- nrow(corMats[[x]])
+          predMat <- corMats[[x]][(norig[x]+1):nr,1:norig[x]]%*%
+            chol2inv(chol(corMats[[x]][(1:norig[x]),(1:norig[x])]))
+          thepred <- predVals[pred.grps==ugrps[x]]+(1/W2[pred.grps==ugrps[x]])*(predMat%*%(glsobj$residuals[glsobj$groups==ugrps[x]]*W1[glsobj$groups==ugrps[x]]))
+          thepred.se <- sqrt((1-rowSums(predMat*corMats[[x]][(norig[x]+1):nr,1:norig[x]])))*(1/W2[pred.grps==ugrps[x]])
+          return(list(thepred=thepred,thepred.se=thepred.se))
+        }
+        tmp <- lapply(1:length(ugrps),getpred)
+        allpreds <- rep(0,nrow(newdframe))
+        allpreds.se <- rep(0,nrow(newdframe))
+        for(gr in 1:length(ugrps)){
+          allpreds[pred.grps==ugrps[gr]] <- tmp[[gr]]$thepred
+          allpreds.se[pred.grps==ugrps[gr]] <- tmp[[gr]]$thepred.se
+        }
+      }
+    } # End else
+  } else {
+    allpreds <- predVals
+    allpreds.se <- (1/W2)*rep(1,nrow(newdframe))
+  }#End if "corStruct"%in%names(glsobj$modelStruct) statement
+  
+  ## Calculate upper and lower interval limits
+  allpreds.se <- glsobj$sigma*sqrt(allpreds.se^2 + var.from.bhat)
+  if(level>1){
+    level <- level/100
+  }
+  alpha <- 1-level
+  P <- length(coef(glsobj))
+  low <- allpreds - qt(1-alpha/2, df=n-P)*allpreds.se
+  up <- allpreds + qt(1-alpha/2, df=n-P)*allpreds.se
+  
+  ## Return the predictions and predictive SE
+  return(cbind(newdframe,data.frame(Prediction=allpreds,
+                                    SE.pred=allpreds.se,
+                                    lwr=low,
+                                    upr=up)))
+}
+stdres.gls <- function(glsobj){
+  
+  ## If original model has a variance structure then construct the diagonal
+  ## matrices accordingly
+  if("varStruct"%in%names(glsobj$modelStruct)){
+    
+    Dinv <- varWeights(glsobj$modelStruct$varStruct)*(1/sigma(glsobj))
+    
+  } else {
+    
+    ## No variance model structure then weights are all 1
+    norig <- nrow(eval(glsobj$call$data))
+    Dinv <- rep(1,norig)*(1/sigma(glsobj))
+    
+  } ## End if("varStruct"%in%names(glsobj$modelStruct))
+  
+  if("corStruct"%in%names(glsobj$modelStruct)){
+    
+    # cor.pars <- coef(glsobj$modelStruct$corStruct,unconstrained=FALSE)
+    # cor.call <- deparse(glsobj$call$correlation)
+    # cor.call <- paste(substr(cor.call,1,nchar(cor.call)-1),", value = c(",
+    #                   paste(as.character(cor.pars),collapse=","),"),fixed=TRUE)")
+    # Linv <- corMatrix(Initialize(eval(parse(text=cor.call)),
+    #                              data=eval(glsobj$call$data)), 
+    #                   corr=FALSE)
+    Linv <- corMatrix(glsobj$modelStruct$corStruct, corr=FALSE)
+    if(is.null(glsobj$groups) | length(unique(glsobj$group))==1){
+      #decorr.resid <- as.numeric(solve(t(chol(R)))%*%glsobj$residuals)*Dinv
+      decorr.resid <- as.numeric(Linv%*%glsobj$residuals)*Dinv
+    } else {
+      
+      resid.list <- base::split(residuals(glsobj), getGroups(glsobj))
+      decorr.resid <- sapply(1:length(resid.list), function(gind){
+        #as.numeric(solve(t(chol(R[[gind]])))%*%resid.list[[gind]])
+        as.numeric(Linv[[gind]]%*%resid.list[[gind]])
+      })
+      decorr.resid <- c(decorr.resid)*Dinv
+      
+    } ## End groups if statement
+    
+  } else {
+    
+    decorr.resid <- Dinv*glsobj$residuals
+    
+  } ## End if("corStruct"%in%names(glsobj$modelStruct))
+  
+  return(decorr.resid)
+  
+} #End stdres.gls function
+```
+
+```{r}
+# Read in the data 
+pine <- read.csv("/Users/camillahandley/Desktop/Stat 536/LodgepoleInUintas.csv")
+
+# Filter out the 
+test <- pine %>% filter(is.na(Lodgepole))
+pine <- pine %>% filter(!is.na(Lodgepole))
+
+# ggpairs(pine)
+```
+
+```{r}
+# Is the test set within the range of the original set? 
+ggplot(data = pine, mapping = aes(x = LON, y = LAT)) + geom_point() +
+  geom_point(data = test, mapping = aes(x = LON, y = LAT), col = "red")
+
+c(min(pine$Slope), max(pine$Slope))
+c(min(test$Slope), max(test$Slope))
+
+# Slope looks fine
+
+c(min(pine$ELEV),max(pine$ELEV))
+c(min(test$ELEV), max(test$ELEV))
+
+# Elevation may be a little out of range in the test set 
+
+c(min(pine$Aspect),max(pine$Aspect))
+c(min(test$Aspect),max(test$Aspect))
+# little lower Aspect in test set 
+
+```
+
+
+```{r}
+# Make a spatial map
+ggplot(data = pine, mapping = aes(x = LON, y = LAT, col = Lodgepole)) +
+  geom_point() + labs(col = "Basal Area")
+  
+
+# Look at individual relationships with Lodgepole
+ggplot(data = pine, mapping = aes(x = log(Slope), y = Lodgepole)) + 
+  geom_point() +
+  geom_smooth()
+
+ggplot(data = pine, mapping = aes(x = Slope, y = Lodgepole)) + 
+  geom_point() +
+  geom_smooth()
+
+ggplot(data = pine, mapping = aes(x = Aspect, y = Lodgepole)) + 
+  geom_point() +
+  geom_smooth()
+
+# Maybe some non-linearity here 
+ggplot(data = pine, mapping = aes(x = ELEV, y = Lodgepole)) + 
+  geom_point() +
+  geom_smooth()
+```
+```{r}
+# Fit a really simple linear model 
+lm <- lm(log(Lodgepole)~. -LON -LAT , data = pine)
+summary(lm)
+plot(lm)
+avPlots(lm)
+
+ggplot(data = pine, mapping = aes(x = LON, y = LAT, col = lm$residuals)) + geom_point()
+```
+```{r}
+# Try to account for non-linearity in Elevation 
+
+# Cross validation to choose number of knots
+rmseknot <- rep(NA, times = 10)
+rmse <- rep(NA, times = 114)
+for(j in 1:10){
+  for(i in 1:114){
+    test.set <- pine[i,]
+    train.set <- pine[-i,]
+    fit <- lm(log(Lodgepole) ~ Slope + Aspect + ns(ELEV, df = j), data = train.set)
+    pred <- predict(fit, newdata = test.set)
+    rmse[i] <- sqrt(mean((test.set$Lodgepole - as.numeric(pred))^2))
+  }
+  rmseknot[j] <- mean(rmse)
+}
+
+plot(rmseknot)
+min(rmseknot)
+# 2 knots for Elevation 
+
+# Log transform does worse than Natural Spline
+# Polynomial also does not do as well as NS 
+```
+
+
+```{r}
+# Cross validation to choose number of knots
+rmseknot <- rep(NA, times = 10)
+rmse <- rep(NA, times = 114)
+for(j in 1:10){
+  for(i in 1:114){
+    test.set <- pine[i,]
+    train.set <- pine[-i,]
+    fit <- lm(log(Lodgepole)~ Slope + ns(Aspect, df = j) + ns(ELEV, df = 2), data = train.set)
+    pred <- predict(fit, newdata = test.set)
+    rmse[i] <- sqrt(mean((test.set$Lodgepole - as.numeric(pred))^2))
+  }
+  rmseknot[j] <- mean(rmse)
+}
+
+plot(rmseknot)
+min(rmseknot)
+# 2 knots for Aspect  
+```
+```{r}
+rmse <- rep(NA, times = 114)
+for(i in 1:114){
+    test.set <- pine[i,]
+    train.set <- pine[-i,]
+    fit <- gam(log(Lodgepole)~  Slope + s(Aspect) + s(ELEV), data = train.set)
+    pred <- predict(fit, newdata = test.set)
+    rmse[i] <- sqrt(mean((test.set$Lodgepole - as.numeric(pred))^2))
+}
+mean(rmse)
+
+```
+
+```{r}
+# Now compare AIC 
+model1 <- lm(log(Lodgepole)~ Slope + ns(Aspect, df = 2) + ns(ELEV, df = 2), data = pine)
+model2 <- gam(log(Lodgepole)~ Slope + s(Aspect) + s(ELEV), data = pine)
+
+AIC(model1)
+AIC(model2)
+
+# Gam model does better but idk if we can use a GAM with Correlation structure
+```
+```{r}
+hist(model1$residuals, breaks = 20)
+plot(model1$fitted.values, model1$residuals)
+# Still look funky 
+avPlots(model1)
+```
+
+```{r}
+# Now let's look into spatial correlation 
+logdeDF <- data.frame(Lon=pine$LON, Lat=pine$LAT, resids=model1$residuals)
+residVariogram <- variogram(object=resids~1, locations=~Lon+Lat, data=logdeDF)
+plot(residVariogram, xlab = "Distance", ylab = "SemiVariance", main = "Variogram")
+```
+```{r}
+# Try out different correlation structures
+exp.gls <- gls(log(Lodgepole)~ Slope + ns(Aspect, df = 2) + ns(ELEV, df = 2), 
+               correlation=corExp(form=~LAT + LON,nugget=TRUE), data = pine, method = "ML")
+spher.gls <- gls(log(Lodgepole)~ Slope + ns(Aspect, df = 2) + ns(ELEV, df = 2), 
+               correlation=corSpher(form=~LAT + LON,nugget=TRUE), data = pine, method = "ML")
+gaus.gls <- gls(log(Lodgepole)~  Slope + ns(Aspect, df = 2) + ns(ELEV, df = 2), 
+               correlation=corGaus(form=~LAT + LON,nugget=TRUE), data = pine, method = "ML")
+AIC(exp.gls)
+AIC(spher.gls)
+AIC(gaus.gls)
+
+# exponential correlation does the best
+```
+
+```{r}
+# Check the assumptions
+std.res <- stdres.gls(exp.gls)
+
+ggplot() + geom_histogram(aes(std.res), bins = 30) + 
+   xlab("Standardized Residuals") + ylab("Count")
+
+ggplot(mapping = aes(x = exp(exp.gls$fitted), y = std.res)) + geom_point() +
+  xlab("Fitted Values") + ylab("Residuals")
+
+# Plot the variogram
+residDF <- data.frame(Lon=pine$LON, Lat=pine$LAT, decorrResid=std.res)
+residVariogram <- variogram(object=decorrResid~1, locations=~Lon+Lat, data=residDF)
+plot(residVariogram, xlab = "Distance", ylab = "SemiVariance", main = "Variogram")
+
+```
+
+```{r}
+# Check predictive capability of the model
+rmse <- rep(NA, 114)
+bias <- rep(NA, 114)
+cover <- rep(NA, 114)
+
+for(i in 1:114){
+    test.set <- pine[i,]
+    train.set <- pine[-i,]
+    fit <- gls(log(Lodgepole) ~ Slope + ns(Aspect, df = 2) + ns(ELEV, df = 2), 
+               correlation=corExp(form = ~LAT + LON, nugget=TRUE), data = train.set, method = "ML")
+    
+    pred <- predictgls(fit, newdframe = test.set)
+    rmse[i] <- sqrt(mean((test.set$Lodgepole - exp(pred$Prediction))^2))
+    cover[i] <- (exp(pred$lwr) < test.set$Lodgepole) & (exp(pred$upr) > test.set$Lodgepole)
+    bias[i] <- exp(pred$Prediction) - test.set$Lodgepole
+}
+
+mean(rmse)
+mean(bias)
+mean(cover)
+
+# Find psuedo R^2 
+cor(pine$Lodgepole, exp(exp.gls$fitted))^2
+```
+```{r}
+sd(pine$Lodgepole)
+max(pine$Lodgepole) - min(pine$Lodgepole)
+# summary(exp.gls)
+confint(exp.gls)
+coef(exp.gls)
+
+```
+```{r}
+# What is the effect of Elevation?? 
+# hold everything else constant at the average value, span Elevation 
+elevations <- seq(6500,11200, length.out = 114)
+new <- data.frame(Slope = rep(mean(pine$Slope, times = 114)), Aspect = rep(mean(pine$Aspect, times = 114)),
+                  ELEV = elevations, LON = rep(mean(pine$LON, times = 114)), 
+                  LAT = rep(mean(pine$LON, times = 114)))
+preds <- predictgls(exp.gls, newdframe = new)
+
+ggplot(data = preds, mapping = aes(x = ELEV)) + 
+  geom_ribbon(aes(ymin = exp(lwr), ymax = exp(upr)), fill = "lightsteelblue2") +
+  geom_line(aes(y = exp(Prediction)), col = "dodgerblue4") + 
+  ggtitle("Change in Basal Area Based on Elevation") +
+  xlab("Elevation") +
+  ylab("Lodgepole Basal Area") +
+  geom_point(mapping = aes(x = pine$ELEV, y = pine$Lodgepole), alpha = 0.3)
+
+```
+
+```{r}
+# What is the effect of Aspect?? 
+# hold everything else constant at the average value, span Elevation 
+aspects <- seq(0,360, length.out = 114)
+new <- data.frame(Slope = rep(mean(pine$Slope, times = 114)), Aspect = aspects,
+                  ELEV = rep(mean(pine$ELEV, times = 114)), LON = rep(mean(pine$LON, times = 114)), 
+                  LAT = rep(mean(pine$LON, times = 114)))
+preds <- predictgls(exp.gls, newdframe = new)
+
+ggplot(data = preds, mapping = aes(x = Aspect)) + 
+  geom_ribbon(aes(ymin = exp(lwr), ymax = exp(upr)), fill = "lightsteelblue2") +
+  geom_line(aes(y = exp(Prediction)), col = "dodgerblue4") + 
+  ggtitle("Change in Basal Area Based on Aspect") +
+  xlab("Aspect") +
+  ylab("Lodgepole Basal Area") +
+  geom_point(mapping = aes(x = pine$Aspect, y = pine$Lodgepole), alpha = 0.3)
+
+```
+```{r}
+# Look at slope just to make sure 
+slopes <- seq(0,90, length.out = 114)
+new <- data.frame(Slope = slopes, Aspect = rep(mean(pine$Aspect, times = 114)),
+                  ELEV = rep(mean(pine$ELEV, times = 114)), LON = rep(mean(pine$LON, times = 114)), LAT = rep(mean(pine$LON, times = 114)))
+preds <- predictgls(exp.gls, newdframe = new)
+
+ggplot(data = preds, mapping = aes(x = Slope)) + 
+  geom_ribbon(aes(ymin = exp(lwr), ymax = exp(upr)), fill = "lightsteelblue2") +
+  geom_line(aes(y = exp(Prediction)), col = "dodgerblue4") + 
+  ggtitle("Change in Basal Area Based on Slope") +
+  xlab("Slope") +
+  ylab("Lodgepole Basal Area") +
+  geom_point(mapping = aes(x = pine$Slope, y = pine$Lodgepole), alpha = 0.3)
+
+```
+
+
+```{r}
+# What about the areas that they couldn't calculate? 
+newlocations <- predictgls(exp.gls, newdframe = test)
+
+write.csv(newlocations, "/Users/camillahandley/Desktop/Stat 536/FinalPreds.csv")
+
+ggplot(data = newlocations, mapping = aes(x = LON, y = LAT, col = exp(Prediction))) + 
+  geom_point() + 
+  labs(col = "Predicted Basal Area") + 
+  xlab("Longitude") +
+  ylab("Latitude")
+  
+
+ggplot(data = newlocations, mapping = aes(x = ELEV)) + 
+  geom_ribbon(aes(ymin = exp(lwr), ymax = exp(upr)), fill = "lightsteelblue2") +
+  geom_line(aes(y = exp(Prediction)), col = "dodgerblue4") + 
+  ggtitle("Basal Area Predictions and Elevation") +
+  xlab("Elevation") +
+  ylab("Lodgepole Basal Area") 
+
+
+```
+
+
+
+
+
+
+

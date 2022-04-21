@@ -1,0 +1,444 @@
+---
+title: "Final536"
+author: "Camilla Handley"
+date: "4/14/2021"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(ranger)
+library(randomForest)
+library(caret)
+library(forcats)
+library(keras)
+library(purrr)
+library(tidyverse)
+library(discrim)
+library(themis)
+library(hardhat)
+library(rsample)
+library(glmnet)
+library(gam)
+library(pROC)
+```
+
+```{r, echo = F}
+# Read in the data 
+tulips <- read.csv("/Users/camillahandley/Desktop/Stat 536/Germination.csv")
+tulips <- tulips[,c(2,5,6)]
+tulips$Population <- as.factor(tulips$Population)
+tulips$Germinated <- ifelse(tulips$Germinated == "Y", 1, 0)
+```
+
+```{r}
+# Explore the data 
+ggplot(data = tulips, mapping = aes(x = as.factor(Germinated))) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Germinated Tulips",
+    x = "Germinated or Not",
+    y = "Number of Tulips"
+  ) 
+# Pretty even between the two groups - not bad 
+
+# See how many from each population were germinated 
+pop <- tulips %>% group_by(Population, Germinated) %>% add_count() %>% 
+  mutate(status = paste(Population, Germinated, sep = "-"))
+pop$status <- factor(pop$status, levels = c("1-0","1-1", "2-0", "2-1", "3-0","3-1", "4-0","4-1",
+                                            "5-0", "5-1", "6-0", "6-1", "7-0", "7-1","8-0", "8-1",
+                                            "9-0", "9-1","10-0", "10-1", "11-0", "11-1","12-0"))
+pop$Germinated <- factor(pop$Germinated, labels = c("No", "Yes"))
+
+ggplot(data = pop, mapping = aes(x = status, y = n, fill = Germinated)) +
+  geom_bar(stat="identity") +
+  labs(
+    title = "Distribution of Germinated Tulips by Population",
+    x = "Population/Germination",
+    y = "Number of Tulips"
+  ) 
+# Population 12 had no tulips germinate 
+
+# Look into the effect of Chilling time 
+chill <- tulips %>% group_by(ChillingTime, Germinated) %>% add_count() %>% 
+  mutate(status = paste(ChillingTime, Germinated, sep = "-"))
+
+chill$status <- factor(chill$status, levels = c("0-0","0-1","2-0","2-1","4-0","4-1","6-0","6-1",
+                                                "8-0", "8-1" ,"10-0", "10-1", "12-0", "12-1"))
+chill$Germinated <- factor(chill$Germinated, labels = c("No", "Yes"))
+ggplot(data = chill, mapping = aes(x = status, y = n, fill = Germinated)) +
+  geom_bar(stat="identity") +
+  labs(
+    title = "Distribution of Germinated Tulips by Chilling Time",
+    x = "Chilling Time/Germination",
+    y = "Number of Tulips", 
+    fill = "Germinated"
+  ) 
+# my guess is a good chilling time would be 8-12 weeks 
+
+
+ggplot(tulips, mapping = aes(x = as.factor(Germinated), y = ChillingTime)) +
+  geom_boxplot()
+
+# Try taking out population 12
+tulips <- tulips %>% filter(Population != 12)
+
+ggplot(tulips, mapping = aes(y = jitter(Germinated), x = jitter(ChillingTime), group = 1)) +
+  geom_point() + geom_smooth()
+
+ggplot(tulips %>% filter(Population == 11), mapping = aes(y = jitter(Germinated), x = jitter(ChillingTime), group = 1)) +
+  geom_point() + geom_smooth()
+
+```
+
+
+```{r}
+# Run a logistic regression as a baseline
+
+# Create a training and test set 
+set.seed(123)
+test.rows <- sample(nrow(tulips), size = nrow(tulips)*.2)
+test <- tulips[test.rows,]
+train <- tulips[-test.rows,]
+
+log.train <- glm(Germinated~. +Population*ChillingTime, data = train, family = binomial)
+summary(log.train)
+
+pred.prob <- predict(log.train, newdata = test, type = "response")
+
+thresh <- seq(from=0, to=1, length=1000)
+misclass <- rep(NA,length=length(thresh)) 
+
+for(i in 1:length(thresh)) {
+  #If probability greater than threshold then 1 else 0
+  my.classification <- ifelse(pred.prob>thresh[i], 1, 0)
+  
+  # calculate the pct where my classification not equal truth
+  misclass[i] <- mean(my.classification!=test$Germinated)
+}
+#Find threshold which minimizes miclassification
+min_thresh <- thresh[which.min(misclass)]
+
+pred_class <- ifelse(pred.prob>min_thresh,1,0)
+(conf_matrix <- addmargins(table(factor(test$Germinated, levels=c(1,0)), factor(pred_class, levels=c(1,0)))))
+
+# Find sensitivity, specificity, ppv and npv
+(sens <- conf_matrix[1,1]/conf_matrix[1,3])
+(spec <- conf_matrix[2,2]/conf_matrix[2,3])
+(ppv <- conf_matrix[1,1]/conf_matrix[3,1])
+(npv <- conf_matrix[2,2]/conf_matrix[3,2])
+
+# Find model accuracy - F-Score
+(f_score <- 2 * (ppv*sens) / (ppv + sens))
+
+my.roc <- roc(test$Germinated, as.numeric(pred.prob))
+# ggplot() + geom_line(aes(x=1-my.roc[["specificities"]], y=my.roc[["sensitivities"]])) + 
+#   geom_abline(intercept=0, slope=1)
+auc(my.roc)
+```
+
+
+
+```{r}
+# Fit an in-sample model (with all the data)
+log.full <- glm(Germinated~. +Population*ChillingTime, data = tulips, family = binomial)
+summary(log.full)
+
+pred.prob <- predict(log.full, type = "response")
+
+thresh <- seq(from=0, to=1, length=1000)
+misclass <- rep(NA,length=length(thresh)) 
+
+for(i in 1:length(thresh)) {
+  #If probability greater than threshold then 1 else 0
+  my.classification <- ifelse(pred.prob>thresh[i], 1, 0)
+  
+  # calculate the pct where my classification not equal truth
+  misclass[i] <- mean(my.classification!=tulips$Germinated)
+}
+#Find threshold which minimizes miclassification
+min_thresh <- thresh[which.min(misclass)]
+
+pred_class <- ifelse(pred.prob>min_thresh,1,0)
+(conf_matrix <- addmargins(table(factor(tulips$Germinated, levels=c(1,0)), factor(pred_class, levels=c(1,0)))))
+
+# Find sensitivity, specificity, ppv and npv
+(sens <- conf_matrix[1,1]/conf_matrix[1,3])
+(spec <- conf_matrix[2,2]/conf_matrix[2,3])
+(ppv <- conf_matrix[1,1]/conf_matrix[3,1])
+(npv <- conf_matrix[2,2]/conf_matrix[3,2])
+
+# Find model accuracy - F-Score
+(f_score <- 2 * (ppv*sens) / (ppv + sens))
+
+my.roc <- roc(tulips$Germinated, as.numeric(pred.prob))
+# ggplot() + geom_line(aes(x=1-my.roc[["specificities"]], y=my.roc[["sensitivities"]])) + 
+#   geom_abline(intercept=0, slope=1)
+auc(my.roc)
+```
+
+```{r}
+# Fit a model with no interaction 
+log.noint <- glm(Germinated~., data = tulips, family = binomial)
+summary(log.noint)
+
+# Perform a LRT for the interaction
+-2*logLik(log.noint)
+-2*logLik(log.full)
+stat <- 2269.865 - 2140.954
+1 - pchisq(stat, 10)
+```
+
+```{r}
+# Check out the coefficients (bootstrapping)
+
+coefs_point <- coef(log.full)
+n_obs <- nrow(tulips)
+# get bootstrap CI
+nreps <- 1000
+coefs <- matrix(NA, nrow = length(coefs_point), ncol = nreps)
+for (i in 1:nreps){
+  this_index <- sample(1:n_obs, size = n_obs, replace = TRUE)
+  this_data <- tulips[this_index,]
+  this_log_mod <- glm(Germinated~. +Population*ChillingTime, data = this_data, family = binomial)
+  this_coefs <- coef(this_log_mod)
+  coefs[,i] <- this_coefs#[,1]
+}
+saveRDS(coefs, 'coefs_bootstrap.rds')
+coefs <- readRDS('coefs_bootstrap.rds')
+
+coef_est <- tibble(point = coefs_point,
+                   se_b = apply(coefs, 1, sd)) %>%
+  mutate(lb_95 = apply(coefs, 1, quantile, probs = 0.025),
+         ub_95 = apply(coefs, 1, quantile, probs = 0.975)) 
+
+effect_est <- coef_est %>%
+  mutate(point = exp(point),
+         lb_95 = exp(lb_95),
+         ub_95 = exp(ub_95)) %>%
+  select(-se_b) #%>%
+ # mutate(sig = (sign(lb_95) ==  sign(ub_95)))
+# Change to how many times more likely is it to happen 
+
+effect_est$name <- c("B0", "Pop2", "Pop3", "Pop4", "Pop5", "Pop6","Pop7", "Pop8", "Pop9", "Pop10", "Pop11", "Chill", "Pop2Chill", "Pop3Chill", "Pop4Chill", "Pop5Chill", "Pop6Chill","Pop7Chill", "Pop8Chill", "Pop9Chill", "Pop10Chill", "Pop11Chill")
+# effect_est <- effect_est %>% select(-c(sig))
+
+colnames(coef_est) <- c("point", "se" , "lb" ,"ub")
+coef_est$point <- round(coef_est$point, digits = 3)
+coef_est$lb <- round(coef_est$lb, digits = 3)
+coef_est$ub <- round(coef_est$ub, digits = 3)
+```
+
+```{r}
+# what is the effect of chilling time
+(pop1 <- effect_est[effect_est$name == "Chill",-4])
+
+(pop2 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop2Chill",-4])
+
+(pop3 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop3Chill",-4])
+
+(pop4 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop4Chill",-4])
+
+(pop5 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop5Chill",-4])
+
+(pop6 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop6Chill",-4])
+
+(pop7 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop7Chill",-4])
+
+(pop8 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop8Chill",-4])
+
+(pop9 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop9Chill",-4])
+
+(pop10 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop10Chill",-4])
+
+(pop11 <- effect_est[effect_est$name == "Chill",-4] + 
+  effect_est[effect_est$name == "Pop11Chill",-4])
+
+
+```
+
+```{r}
+# Make new data to predict for 
+tulip.pred <- data.frame(Population = c(rep(1:11, each = 7)), ChillingTime = rep(seq(0,12,by = 2), times = 11))
+tulip.pred$Population <- as.factor(tulip.pred$Population)
+
+tulip.pred$predict <- predict(log.full, newdata = tulip.pred, type = "response")
+
+ggplot(tulip.pred, mapping = aes(x = ChillingTime, y = predict, col = Population)) +
+  geom_line() +
+  ylab("Predicted Probability of Germination") +
+  xlab("Chilling Time (in weeks)") +
+  scale_x_continuous(breaks=c(0,2,4,6,8,10,12))
+```
+
+```{r}
+# Try a lasso regression
+x <- model.matrix(Germinated ~ bs(ChillingTime, knots = 10, degree = 1) + Population +
+                   Population*ChillingTime, train)
+y <- train$Germinated
+
+# Find the best lambda using cross validation
+cv.lasso <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+best_lam <- cv.lasso$lambda.min
+
+train.model <- glmnet(x, y, alpha = 1, family = "binomial", lambda = best_lam)
+
+#Find threshold that minimizes misclassification 
+pred.prob <- predict(train.model, newx=model.matrix(Germinated ~ bs(ChillingTime, knots = 10, degree = 1) + Population +
+                   Population*ChillingTime, test), 
+                     type = "response")
+
+thresh <- seq(from=0, to=1, length=1000)
+misclass <- rep(NA,length=length(thresh)) 
+
+for(i in 1:length(thresh)) {
+  #If probability greater than threshold then 1 else 0
+  my.classification <- ifelse(pred.prob>thresh[i], 1, 0)
+  
+  # calculate the pct where my classification not equal truth
+  misclass[i] <- mean(my.classification!=test$Germinated)
+}
+#Find threshold which minimizes miclassification
+min_thresh <- thresh[which.min(misclass)]
+plot(x=thresh, y = misclass)
+```
+
+
+
+```{r}
+# Fit the in-sample model
+X <- model.matrix(Germinated~. +Population*ChillingTime, tulips)
+Y <- tulips$Germinated
+
+lasso.fit <- glmnet(X, Y, alpha = 1, family = "binomial", lambda = best_lam)
+
+pred.probs <- predict(lasso.fit, newx=model.matrix(Germinated~. +Population*ChillingTime, tulips), 
+                      type="response")
+
+my.roc <- roc(tulips$Germinated, as.numeric(pred.probs))
+ggplot() + geom_line(aes(x=1-my.roc[["specificities"]], y=my.roc[["sensitivities"]])) + 
+  geom_abline(intercept=0, slope=1)
+auc(my.roc)
+```
+
+```{r}
+# Create a confusion matrix 
+pred_class <- ifelse(pred.probs>min_thresh,1,0)
+(conf_matrix <- addmargins(table(factor(tulips$Germinated, levels=c(1,0)), factor(pred_class, levels=c(1,0)))))
+
+# Find sensitivity, specificity, ppv and npv
+(sens <- conf_matrix[1,1]/conf_matrix[1,3])
+(spec <- conf_matrix[2,2]/conf_matrix[2,3])
+(ppv <- conf_matrix[1,1]/conf_matrix[3,1])
+(npv <- conf_matrix[2,2]/conf_matrix[3,2])
+
+# Find model accuracy - F-Score
+(f_score <- 2 * (ppv*sens) / (ppv + sens))
+```
+
+```{r}
+# Change population to columns (dummy variables)
+tulips$Pop1 <- ifelse(tulips$Population == 1,1,0)
+tulips$Pop2 <- ifelse(tulips$Population == 2,1,0)
+tulips$Pop3 <- ifelse(tulips$Population == 3,1,0)
+tulips$Pop4 <- ifelse(tulips$Population == 4,1,0)
+tulips$Pop5 <- ifelse(tulips$Population == 5,1,0)
+tulips$Pop6 <- ifelse(tulips$Population == 6,1,0)
+tulips$Pop7 <- ifelse(tulips$Population == 7,1,0)
+tulips$Pop8 <- ifelse(tulips$Population == 8,1,0)
+tulips$Pop9 <- ifelse(tulips$Population == 9,1,0)
+tulips$Pop10 <- ifelse(tulips$Population == 10,1,0)
+tulips$Pop11 <- ifelse(tulips$Population == 11,1,0)
+#tulips$Pop12 <- ifelse(tulips$Population == 12,1,0)
+
+tulips$Germinated <- as.factor(tulips$Germinated)
+```
+
+
+```{r}
+# make a new training and test set 
+tulip_split <- initial_split(tulips, prop = .8)
+tulip_train <- training(tulip_split)
+tulip_test  <- testing(tulip_split)
+
+# Try a random forest
+rf.train <- ranger(Germinated~., data = tulip_train)
+rf.train
+```
+
+```{r}
+# Tune our model
+
+# names of features
+features <- setdiff(names(tulip_train), "Germinated")
+
+model2 <- tuneRF(
+  x          = tulip_train[features],
+  y          = tulip_train$Germinated,
+  ntreeTry   = 500,
+  mtryStart  = 2,
+  stepFactor = 1.5,
+  improve    = 0.01,
+  trace      = FALSE      # to not show real-time progress 
+)
+# 6 is the best value for mtry
+```
+
+```{r}
+hyper_grid <- expand.grid(
+  node_size  = seq(3, 9, by = 2),
+  sampe_size = c(.55, .632, .70, .80),
+  ntree = seq(100, 300, by = 25),
+  OOB_PredErr   = 0
+)
+
+for(i in 1:nrow(hyper_grid)) {
+  
+  # train model
+  model <- ranger(
+    formula         = Germinated ~ ., 
+    data            = tulip_train, 
+    num.trees       = hyper_grid$ntree[i],
+    mtry            = 6,
+    min.node.size   = hyper_grid$node_size[i],
+    sample.fraction = hyper_grid$sampe_size[i],
+    seed            = 123
+  )
+  
+  # add OOB error to grid
+  hyper_grid$OOB_PredErr[i] <- model$prediction.error
+}
+
+hyper_grid %>% 
+  dplyr::arrange(OOB_PredErr) %>%
+  head(10)
+```
+
+
+```{r}
+# Build the final model 
+rf.fit <- ranger(formula = Germinated ~ ., 
+    data = tulip_train, 
+    num.trees = 175,
+    sample.fraction = 0.55,
+    mtry = 6,
+    importance = "impurity"
+)
+
+rf.fit$prediction.error
+
+```
+
